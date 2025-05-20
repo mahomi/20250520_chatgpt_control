@@ -1,0 +1,799 @@
+위의 변경사항을 적용하여, M:\TEST\autogluon_rolling_window.py 파일이 아래와 같이 성공적으로 수정되었습니다. 변경사항이 제대로 적용되었는지 확인하고 잘못된 부분은 다시 file-apply-diff 명령을 호출해 수정해라.
+파일 내용:
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import optuna  # Optuna 임포트
+from datetime import datetime, timedelta
+import joblib
+from feature_engineering import create_base_features, process_outliers_and_na, apply_stats_to_df
+import matplotlib.dates as mdates
+import pickle
+from autogluon.tabular import TabularPredictor  # AutoGluon 임포트
+
+
+def main():
+    # Optuna를 이용한 전체 소르티노 비율 최적화
+    def objective(trial):
+        params = {
+            "input_pickle_path": "./XRPUSDT_1h_40000.pickle",
+            "results_dir": "./optuna_ag_results",
+            "train_hours": trial.suggest_int("train_hours", 48, 240),
+            "val_hours": trial.suggest_int("val_hours", 24, 72),
+            "prob_threshold": trial.suggest_float("prob_threshold", 0.6, 0.9, step=0.05),
+            "fee_rate": 0.0007,
+            "target_percentage": 0.01,
+            "time_limit": trial.suggest_int("time_limit", 180, 600),
+            "presets": "medium_quality",
+            "num_trials": trial.suggest_int("num_trials", 0, 5),
+            "resume": True
+        }
+        os.makedirs(params["results_dir"], exist_ok=True)
+        summary = run_rolling_window_test(params)
+        return summary.get('sortino_ratio_overall', float('-inf'))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=20)
+    best = study.best_trial
+    print(f"Best overall Sortino Ratio: {best.value}")
+    print("Best parameters:")
+    for k, v in best.params.items():
+        print(f"  {k}: {v}")
+    return
+
+
+def load_and_prepare_base_data(pickle_path, target_percentage=0.01):
+    """
+    피클 파일에서 데이터를 로드하고 기본 피처만 생성하는 함수
+    (이상치 처리 및 NaN 값 대체는 각 윈도우에서 별도로 수행)
+    """
+    # 피클 파일 로드
+    with open(pickle_path, 'rb') as f:
+        data_list = pickle.load(f)
+    
+    # 데이터프레임 변환 및 인덱스 설정
+    df = pd.DataFrame(data_list)
+    df['open_time'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('open_time', inplace=True)
+    
+    # 필요한 컬럼만 선택
+    df = df[['open', 'high', 'low', 'close', 'volume']]
+    
+    # 기본 피처 생성
+    df = create_base_features(df, target_percentage=target_percentage)
+    
+    print(f"데이터셋 크기: {df.shape}")
+    print(f"데이터 기간: {df.index.min()} ~ {df.index.max()}")
+    
+    return df
+
+
+def create_rolling_windows(df, train_hours=7, val_hours=3):
+    """
+    데이터프레임을 롤링 윈도우로 분할하는 함수
+    
+    Parameters:
+    -----------
+    df : DataFrame
+        시계열 데이터프레임 (인덱스가 datetime 객체여야 함)
+    train_hours : int
+        학습 기간 (시간)
+    val_hours : int
+        검증 기간 (시간)
+        
+    Returns:
+    --------
+    windows : list of tuples
+        (train_start, train_end, val_start, val_end) 형태의 튜플 리스트 (datetime 객체)
+    """
+    # 데이터 시작일과 종료일 (datetime 객체로 사용)
+    start_datetime = df.index.min()
+    end_datetime = df.index.max()
+    
+    print(f"윈도우 생성 시작일시: {start_datetime}, 종료일시: {end_datetime}")
+    
+    # 롤링 윈도우 생성
+    windows = []
+    current_datetime = start_datetime
+    
+    # 윈도우 생성을 위한 timedelta 객체
+    train_period = timedelta(hours=train_hours)
+    val_period = timedelta(hours=val_hours)
+    one_second = timedelta(seconds=1)
+    
+    while current_datetime + train_period + val_period <= end_datetime + one_second: # 종료일 포함을 위해 1초 더함
+        train_start = current_datetime
+        train_end = current_datetime + train_period - one_second
+        val_start = current_datetime + train_period
+        val_end = current_datetime + train_period + val_period - one_second
+        
+        windows.append((train_start, train_end, val_start, val_end))
+        
+        # 다음 윈도우로 이동 (val_hours일씩 이동)
+        current_datetime += val_period
+    
+    return windows
+
+
+def backtest_strategy_core(results, prices, prob_threshold=0.7, fee_rate=0.001):
+    """
+    백테스트의 핵심 로직을 처리하는 공통 함수
+    
+    Parameters:
+    -----------
+    results : DataFrame
+        결과를 저장할 데이터프레임 (포지션, 수익률 등의 컬럼 포함)
+    prices : ndarray
+        가격 데이터 배열
+    prob_threshold : float
+        포지션 진입을 위한 확률 임계값
+    fee_rate : float
+        거래 수수료율
+        
+    Returns:
+    --------
+    results : DataFrame
+        백테스트 결과가 업데이트된 데이터프레임
+    """
+    # 포지션 및 수익률 계산을 위한 초기화
+    results['position'] = 0  # 0: 포지션 없음, 1: 롱, -1: 숏
+    results['entry_price'] = np.nan  # 진입 가격
+    results['exit_price'] = np.nan  # 청산 가격
+    results['trade'] = 0  # 거래 발생 여부
+    results['trade_return'] = 0.0  # 거래별 수익률
+    results['cum_return'] = 0.0  # 누적 수익률
+    
+    # 백테스트 로직
+    current_position = 0  # 현재 포지션 (0: 없음, 1: 롱, -1: 숏)
+    entry_price = 0  # 진입 가격
+    
+    for i in range(len(results)-1):  # 마지막 데이터는 다음 봉이 없으므로 제외
+        # 현재 가격
+        current_price = prices[i]
+        next_price = prices[i+1]  # 다음 봉 가격
+        
+        # 이전 포지션이 있는 경우, 다음 봉에서 청산
+        if current_position != 0:
+            # 다음 봉에서 청산
+            exit_price = next_price
+            
+            # 수익률 계산 (롱: (청산가/진입가-1), 숏: (진입가/청산가-1))
+            if current_position == 1:
+                trade_return = exit_price / entry_price - 1
+            else:  # current_position == -1
+                trade_return = entry_price / exit_price - 1
+                
+            # 수수료 차감
+            trade_return = trade_return - fee_rate
+            
+            # 결과 기록
+            results.iloc[i+1, results.columns.get_loc('trade')] = 1
+            results.iloc[i+1, results.columns.get_loc('exit_price')] = exit_price
+            results.iloc[i+1, results.columns.get_loc('trade_return')] = float(trade_return)
+            
+            # 포지션 초기화
+            current_position = 0
+            entry_price = 0
+        
+        # 포지션이 없는 경우, 새로운 진입 신호 체크
+        if current_position == 0:
+            # 1% 상승 확률이 임계값 이상이면 롱 포지션 진입
+            if results.iloc[i]['up_pred_proba'] >= prob_threshold:
+                current_position = 1
+                entry_price = current_price
+                results.iloc[i, results.columns.get_loc('position')] = current_position
+                results.iloc[i, results.columns.get_loc('entry_price')] = entry_price
+                results.iloc[i, results.columns.get_loc('trade')] = 1
+                results.iloc[i, results.columns.get_loc('trade_return')] = float(-fee_rate)  # 진입 수수료
+            
+            # 1% 하락 확률이 임계값 이상이면 숏 포지션 진입
+            elif results.iloc[i]['down_pred_proba'] >= prob_threshold:
+                current_position = -1
+                entry_price = current_price
+                results.iloc[i, results.columns.get_loc('position')] = current_position
+                results.iloc[i, results.columns.get_loc('entry_price')] = entry_price
+                results.iloc[i, results.columns.get_loc('trade')] = 1
+                results.iloc[i, results.columns.get_loc('trade_return')] = float(-fee_rate)  # 진입 수수료
+        else:
+            # 현재 포지션 유지
+            results.iloc[i, results.columns.get_loc('position')] = current_position
+            results.iloc[i, results.columns.get_loc('entry_price')] = entry_price
+    
+    # 누적 수익률 계산
+    results['cum_return'] = results['trade_return'].cumsum()
+    results['cum_return_pct'] = (np.exp(results['cum_return']) - 1) * 100  # 퍼센트로 변환
+    
+    return results
+
+
+def calculate_performance_metrics(results):
+    """
+    백테스트 결과에서 성능 지표를 계산하는 공통 함수
+    
+    Parameters:
+    -----------
+    results : DataFrame
+        백테스트 결과 데이터프레임
+        
+    Returns:
+    --------
+    dict
+        성능 지표 딕셔너리
+    """
+    # 매매 통계
+    total_trades = results['trade'].sum()
+    winning_trades = len(results[results['trade_return'] > 0])
+    losing_trades = len(results[results['trade_return'] < 0])
+    win_rate = winning_trades / total_trades if total_trades > 0 else 0
+    
+    # 수익률 통계
+    total_return = results['cum_return_pct'].iloc[-1]
+    
+    # 소르티노 비율 계산 (일별 기준으로 변환)
+    # 1시간봉 데이터를 일별로 리샘플링하여 계산
+    daily_returns = results['trade_return'].resample('D').sum()
+    avg_daily_return = daily_returns.mean()
+    negative_daily_returns = daily_returns[daily_returns < 0]
+    downside_deviation = np.sqrt(np.mean(negative_daily_returns**2)) if len(negative_daily_returns) > 0 else 0
+    sortino_ratio = avg_daily_return / downside_deviation if downside_deviation != 0 else 0
+    
+    return {
+        'total_trades': total_trades,
+        'winning_trades': winning_trades,
+        'losing_trades': losing_trades,
+        'win_rate': win_rate,
+        'total_return': total_return,
+        'sortino_ratio': sortino_ratio
+    }
+
+
+def backtest_strategy(val_df, up_model, down_model, window_idx, train_start, train_end, val_start, val_end, 
+                      prob_threshold=0.7, fee_rate=0.001, results_dir="./results", use_save_each_window_result=True):
+    """
+    일반 모델 예측을 기반으로 거래 전략을 백테스트하는 함수
+    
+    Parameters:
+    -----------
+    val_df : DataFrame
+        검증 기간의 데이터프레임 (이상치 처리 및 NaN 값 대체 완료된 상태)
+    up_model : 학습된 모델 객체
+        1% 상승 예측에 사용할 모델
+    down_model : 학습된 모델 객체
+        1% 하락 예측에 사용할 모델
+    window_idx : int
+        윈도우 인덱스
+    train_start, train_end, val_start, val_end : datetime.datetime
+        학습 및 검증 기간 (datetime 객체)
+    prob_threshold : float
+        포지션 진입을 위한 확률 임계값 (기본값: 0.7)
+    fee_rate : float
+        거래 수수료율 (기본값: 0.1%)
+    results_dir : str
+        결과 저장 디렉토리
+    use_save_each_window_result : bool
+        각 윈도우 결과를 파일로 저장할지 여부
+        
+    Returns:
+    --------
+    summary : dict
+        백테스트 결과 요약
+    results : DataFrame
+        백테스트 결과 데이터프레임 (누적수익률 곡선용)
+    """
+    if len(val_df) == 0:
+        print(f"경고: 윈도우 {window_idx}의 검증 기간 {val_start} ~ {val_end}에 데이터가 없습니다.")
+        return None, None
+    
+    # 예측에 사용할 피처 준비
+    features_to_drop = ['target_log_return_next', 'target_up', 'target_down', 'timestamp']
+    X_val = val_df.drop(columns=features_to_drop, errors='ignore')
+    X_val = X_val.select_dtypes(include=[np.number])
+    
+    # 모델 예측
+    up_pred_proba = up_model.predict_proba(X_val)[:, 1]  # 1% 상승 확률
+    down_pred_proba = down_model.predict_proba(X_val)[:, 1]  # 1% 하락 확률
+    
+    # 결과 데이터프레임 생성
+    results = val_df.copy()
+    results['up_pred_proba'] = up_pred_proba
+    results['down_pred_proba'] = down_pred_proba
+    
+    # 가격 데이터 (close 가격 사용)
+    prices = results['close'].values
+    
+    # 백테스트 핵심 로직 실행
+    results = backtest_strategy_core(results, prices, prob_threshold, fee_rate)
+    
+    # 성능 지표 계산
+    metrics = calculate_performance_metrics(results)
+    
+    # 결과 저장 (옵션)
+    if use_save_each_window_result:
+        results.to_csv(os.path.join(results_dir, f'window_{window_idx}_backtest_results.csv'))
+        # 누적 수익 곡선 그래프 저장
+        plt.figure(figsize=(12, 6))
+        plt.plot(results.index, results['cum_return_pct'])
+        plt.title(f'Window {window_idx} Cumulative Returns (Next Candle Exit, Probability Threshold: {prob_threshold})')
+        plt.xlabel('Date')
+        plt.ylabel('Cumulative Returns (%)')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f'window_{window_idx}_cumulative_returns.png'))
+        plt.close()
+        # 모델 저장
+        up_model_path = os.path.join(results_dir, f'window_{window_idx}_up_model.joblib')
+        down_model_path = os.path.join(results_dir, f'window_{window_idx}_down_model.joblib')
+        joblib.dump(up_model, up_model_path)
+        joblib.dump(down_model, down_model_path)
+    
+    # 요약 통계 반환
+    summary = {
+        'window_idx': window_idx,
+        'train_start': train_start.strftime('%Y-%m-%d %H:%M:%S'), # 문자열로 변환하여 저장
+        'train_end': train_end.strftime('%Y-%m-%d %H:%M:%S'),   # 문자열로 변환하여 저장
+        'val_start': val_start.strftime('%Y-%m-%d %H:%M:%S'),   # 문자열로 변환하여 저장
+        'val_end': val_end.strftime('%Y-%m-%d %H:%M:%S'),     # 문자열로 변환하여 저장
+        'prob_threshold': prob_threshold,
+        **metrics  # 성능 지표 추가
+    }
+    
+    # 결과와 함께 데이터프레임도 반환
+    return summary, results
+
+
+def backtest_strategy_autogluon(val_df, up_predictor, down_predictor, window_idx, train_start, train_end, val_start, val_end, 
+                      prob_threshold=0.7, fee_rate=0.001, results_dir="./results", use_save_each_window_result=True):
+    """
+    AutoGluon 모델 예측을 기반으로 거래 전략을 백테스트하는 함수
+    
+    Parameters:
+    -----------
+    val_df : DataFrame
+        검증 기간의 데이터프레임 (인덱스가 리셋된 상태)
+    up_predictor : AutoGluon TabularPredictor
+        1% 상승 예측에 사용할 모델
+    down_predictor : AutoGluon TabularPredictor
+        1% 하락 예측에 사용할 모델
+    window_idx : int
+        윈도우 인덱스
+    train_start, train_end, val_start, val_end : datetime.datetime
+        학습 및 검증 기간 (datetime 객체)
+    prob_threshold : float
+        포지션 진입을 위한 확률 임계값 (기본값: 0.7)
+    fee_rate : float
+        거래 수수료율 (기본값: 0.1%)
+    results_dir : str
+        결과 저장 디렉토리
+    use_save_each_window_result : bool
+        각 윈도우 결과를 파일로 저장할지 여부
+        
+    Returns:
+    --------
+    summary : dict
+        백테스트 결과 요약
+    results : DataFrame
+        백테스트 결과 데이터프레임 (누적수익률 곡선용)
+    """
+    if len(val_df) == 0:
+        print(f"경고: 윈도우 {window_idx}의 검증 기간 {val_start} ~ {val_end}에 데이터가 없습니다.")
+        return None, None
+    
+    # 원래 datetime 인덱스 저장
+    orig_index = val_df['open_time']
+    
+    # 예측에 필요한 데이터 준비
+    X_val = val_df.copy()
+    for col in ['target_up', 'target_down', 'target_log_return_next']:
+        if col in X_val.columns:
+            X_val = X_val.drop(columns=[col])
+    
+    # AutoGluon 모델로 예측 확률 계산
+    up_pred_proba = up_predictor.predict_proba(X_val)
+    if len(up_pred_proba.columns) >= 2:  # 이진 분류 확인 (True 클래스 확률)
+        up_pred_proba_values = up_pred_proba.iloc[:, 1].values  # True(1)에 대한 확률
+    else:
+        up_pred_proba_values = up_pred_proba.iloc[:, 0].values  # 단일 클래스 경우
+    
+    down_pred_proba = down_predictor.predict_proba(X_val)
+    if len(down_pred_proba.columns) >= 2:  # 이진 분류 확인
+        down_pred_proba_values = down_pred_proba.iloc[:, 1].values  # True(1)에 대한 확률
+    else:
+        down_pred_proba_values = down_pred_proba.iloc[:, 0].values  # 단일 클래스 경우
+    
+    # 결과 데이터프레임 생성 (원본 타임스탬프 인덱스 사용)
+    results = pd.DataFrame()
+    results['open_time'] = orig_index
+    results['close'] = val_df['close'].values
+    results['up_pred_proba'] = up_pred_proba_values
+    results['down_pred_proba'] = down_pred_proba_values
+    
+    # 타임스탬프를 인덱스로 설정
+    results.set_index('open_time', inplace=True)
+    
+    # 가격 데이터 (close 가격 사용)
+    prices = results['close'].values
+    
+    # 백테스트 핵심 로직 실행
+    results = backtest_strategy_core(results, prices, prob_threshold, fee_rate)
+    
+    # 성능 지표 계산
+    metrics = calculate_performance_metrics(results)
+    
+    # 결과 저장 (옵션)
+    if use_save_each_window_result:
+        results.to_csv(os.path.join(results_dir, f'window_{window_idx}_backtest_results.csv'))
+        # 누적 수익 곡선 그래프 저장
+        plt.figure(figsize=(12, 6))
+        plt.plot(results.index, results['cum_return_pct'])
+        plt.title(f'Window {window_idx} Cumulative Returns (Next Candle Exit, Probability Threshold: {prob_threshold})')
+        plt.xlabel('Date')
+        plt.ylabel('Cumulative Returns (%)')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f'window_{window_idx}_cumulative_returns.png'))
+        plt.close()
+    
+    # 요약 통계 반환
+    summary = {
+        'window_idx': window_idx,
+        'train_start': train_start.strftime('%Y-%m-%d %H:%M:%S'),
+        'train_end': train_end.strftime('%Y-%m-%d %H:%M:%S'),
+        'val_start': val_start.strftime('%Y-%m-%d %H:%M:%S'),
+        'val_end': val_end.strftime('%Y-%m-%d %H:%M:%S'),
+        'prob_threshold': prob_threshold,
+        **metrics  # 성능 지표 추가
+    }
+    
+    # 추가 정보: 가장 성능 좋은 모델
+    try:
+        up_best_model = up_predictor.get_model_best()
+        down_best_model = down_predictor.get_model_best()
+        summary['up_best_model'] = str(up_best_model)
+        summary['down_best_model'] = str(down_best_model)
+    except:
+        summary['up_best_model'] = "Unknown"
+        summary['down_best_model'] = "Unknown"
+    
+    return summary, results
+
+
+def run_rolling_window_test(param):
+    """
+    롤링 윈도우 테스트를 실행하는 메인 함수 (AutoGluon 사용)
+    
+    Parameters:
+    -----------
+    param : dict
+        테스트 매개변수 딕셔너리
+        
+    Returns:
+    --------
+    dict
+        테스트 결과 요약
+    """
+    
+    # 결과 저장 디렉토리 생성
+    results_dir = param["results_dir"]
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # 데이터 로드 및 기본 피처 생성
+    input_pickle_path = param["input_pickle_path"]
+    df = load_and_prepare_base_data(input_pickle_path, target_percentage=param["target_percentage"])
+    
+    # 타겟 변수 확인
+    print(f"상승 타겟 ({param['target_percentage']*100}%) 분포:\n{df['target_up'].value_counts(normalize=True)}")
+    print(f"하락 타겟 ({param['target_percentage']*100}%) 분포:\n{df['target_down'].value_counts(normalize=True)}")
+    
+    # 롤링 윈도우 생성
+    windows = create_rolling_windows(df, train_hours=param["train_hours"], val_hours=param["val_hours"])
+    print(f"생성된 롤링 윈도우 수: {len(windows)}")
+    
+    # 첫 5개 윈도우 출력
+    for i, window in enumerate(windows[:5]):
+        print(f"윈도우 {i+1}: 학습 {window[0]} ~ {window[1]}, 검증 {window[2]} ~ {window[3]}")
+    
+    # AutoGluon 모델 파라미터 설정
+    ag_params = {
+        'time_limit': param.get('time_limit', 300),  # 학습 시간 제한 (초)
+        'presets': param.get('presets', 'medium_quality'),  # 학습 품질 설정
+        'verbosity': 2,  # 로그 상세도
+        'num_trials': param.get('num_trials', 5),  # HPO 탐색 횟수 제한
+        'resume': param.get('resume', True)  # HPO 재개 기능 활성화
+    }
+    
+    # 롤링 윈도우 백테스트 실행
+    all_results = []
+    # 누적수익률 곡선용 메모리 저장 리스트
+    all_window_results = []
+    
+    # max_windows_to_test 옵션 적용
+    max_windows = param.get('max_windows_to_test', 0)
+    if max_windows > 0:
+        windows_to_iter = windows[:max_windows]
+    else:
+        windows_to_iter = windows
+    
+    for window_idx, (train_start, train_end, val_start, val_end) in enumerate(windows_to_iter, 1):
+        print(f"\n===== 윈도우 {window_idx}/{len(windows_to_iter)} =====")
+        # datetime 객체를 문자열로 포맷팅하여 출력
+        print(f"학습 기간: {train_start.strftime('%Y-%m-%d %H:%M:%S')} ~ {train_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"검증 기간: {val_start.strftime('%Y-%m-%d %H:%M:%S')} ~ {val_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 학습 데이터 추출 (인덱스가 datetime 객체이므로 직접 비교)
+        train_mask = (df.index >= train_start) & (df.index <= train_end)
+        train_df = df[train_mask].copy()
+        
+        # 검증 데이터 추출 (인덱스가 datetime 객체이므로 직접 비교)
+        val_mask = (df.index >= val_start) & (df.index <= val_end)
+        val_df = df[val_mask].copy()
+        
+        if len(train_df) == 0:
+            print(f"경고: 윈도우 {window_idx}의 학습 기간 {train_start} ~ {train_end}에 데이터가 없습니다.")
+            continue
+        
+        if len(val_df) == 0:
+            print(f"경고: 윈도우 {window_idx}의 검증 기간 {val_start} ~ {val_end}에 데이터가 없습니다.")
+            continue
+        
+        try:
+            # 이상치 처리 및 NaN 값 대체 - 학습 데이터로부터 통계 계산
+            train_df, stats = process_outliers_and_na(train_df, verbose=False)
+            
+            # 같은 통계값을 검증 데이터에 적용
+            val_df = apply_stats_to_df(val_df, stats, verbose=False)
+            
+            # 결측치 제거
+            train_df.dropna(inplace=True)
+            val_df.dropna(inplace=True)
+            
+            # 윈도우별 저장 디렉토리 
+            window_dir = os.path.join(results_dir, f'window_{window_idx}')
+            os.makedirs(window_dir, exist_ok=True)
+            
+            # 학습 데이터 준비 (인덱스 재설정 필요 - AutoGluon 요구사항)
+            features_to_drop_for_X = ['target_log_return_next', 'timestamp']  # 'target_up'과 'target_down'은 남겨둠
+            train_df_ag = train_df.drop(columns=features_to_drop_for_X, errors='ignore').reset_index()
+            val_df_ag = val_df.drop(columns=features_to_drop_for_X, errors='ignore').reset_index()
+            
+            # 타겟 분포 확인
+            up_class_counts = train_df['target_up'].value_counts()
+            down_class_counts = train_df['target_down'].value_counts()
+            
+            # 클래스 불균형 확인 (모두 0 또는 모두 1인 경우 건너뛰기)
+            if len(up_class_counts) < 2 or len(down_class_counts) < 2:
+                print(f"경고: 윈도우 {window_idx}의 타겟 분포가 불균형합니다. 건너뜁니다.")
+                print(f"상승 타겟 분포: {up_class_counts}")
+                print(f"하락 타겟 분포: {down_class_counts}")
+                continue
+            
+            # 하이퍼파라미터 튜닝 설정 - 두 모델 공통으로 사용할 기본 설정
+            hyperparameter_tune_kwargs = {
+                'scheduler': 'local',
+                'searcher': 'auto',
+                'search_options': {
+                    'num_trials': ag_params['num_trials'], # 최대 시도 횟수
+                },
+                'scheduler_options': {
+                    'resume': ag_params['resume']
+                }
+            }
+            
+            # AutoGluon으로 1% 상승 예측 모델 학습
+            print("상승 예측 모델 학습 중...")
+            up_model_path = os.path.join(window_dir, 'up_model')
+            up_predictor = TabularPredictor(
+                label='target_up',
+                path=up_model_path,
+                problem_type='binary'
+            )
+            
+            # 상승 모델 체크포인트 설정
+            up_checkpoint_path = os.path.join(up_model_path, 'ag_hpo_state.pkl')
+            up_hyperparameter_tune_kwargs = hyperparameter_tune_kwargs.copy()
+            up_hyperparameter_tune_kwargs['scheduler_options']['checkpoint'] = up_checkpoint_path
+            
+            up_predictor.fit(
+                train_data=train_df_ag,
+                tuning_data=val_df_ag,
+                time_limit=ag_params['time_limit'],
+                presets=ag_params['presets'],
+                verbosity=ag_params['verbosity'],
+                hyperparameter_tune_kwargs=up_hyperparameter_tune_kwargs
+            )
+            
+            # AutoGluon으로 1% 하락 예측 모델 학습
+            print("하락 예측 모델 학습 중...")
+            down_model_path = os.path.join(window_dir, 'down_model')
+            down_predictor = TabularPredictor(
+                label='target_down',
+                path=down_model_path,
+                problem_type='binary'
+            )
+            
+            # 하락 모델 체크포인트 설정
+            down_checkpoint_path = os.path.join(down_model_path, 'ag_hpo_state.pkl')
+            down_hyperparameter_tune_kwargs = hyperparameter_tune_kwargs.copy()
+            down_hyperparameter_tune_kwargs['scheduler_options']['checkpoint'] = down_checkpoint_path
+            
+            down_predictor.fit(
+                train_data=train_df_ag,
+                tuning_data=val_df_ag,
+                time_limit=ag_params['time_limit'],
+                presets=ag_params['presets'],
+                verbosity=ag_params['verbosity'],
+                hyperparameter_tune_kwargs=down_hyperparameter_tune_kwargs
+            )
+            
+            # 모델 평가 및 리더보드 출력
+            print("\n상승 예측 모델 리더보드:")
+            up_leaderboard = up_predictor.leaderboard(train_df_ag, silent=True)
+            print(up_leaderboard.head())
+            
+            print("\n하락 예측 모델 리더보드:")
+            down_leaderboard = down_predictor.leaderboard(train_df_ag, silent=True)
+            print(down_leaderboard.head())
+            
+            # 백테스트 실행 (AutoGluon 예측기 사용)
+            summary, results_df = backtest_strategy_autogluon(
+                val_df_ag, up_predictor, down_predictor, window_idx, 
+                train_start, train_end, val_start, val_end,
+                prob_threshold=param["prob_threshold"], 
+                fee_rate=param["fee_rate"],
+                results_dir=window_dir,
+                use_save_each_window_result=param["use_save_each_window_result"]
+            )
+            
+            if summary:
+                all_results.append(summary)
+                # 누적수익률 곡선용 데이터 메모리 저장
+                if results_df is not None:
+                    all_window_results.append(results_df)
+                
+                print(f"윈도우 {window_idx} 백테스트 완료")
+                print(f"총 거래 횟수: {summary['total_trades']}")
+                print(f"승률: {summary['win_rate']:.2%}")
+                print(f"총 수익률: {summary['total_return']:.2f}%")
+                print(f"소르티노 비율: {summary['sortino_ratio']:.4f}")
+            else:
+                print(f"윈도우 {window_idx} 백테스트 실패")
+        except Exception as e:
+            print(f"윈도우 {window_idx} 처리 중 오류 발생: {e}")
+            continue
+    
+    # 모든 결과 처리
+    results_summary = {}
+    
+    if all_results:
+        results_df = pd.DataFrame(all_results)
+        results_df.to_csv(os.path.join(results_dir, 'all_windows_results.csv'), index=False)
+        
+        # 전체 자산 변동 및 윈도우별 수익률 비교 그래프 생성
+        all_cum_returns_pct = pd.Series(dtype=float) # 초기화
+        all_datetimes = [] # 초기화
+        
+        if len(all_window_results) > 0:
+            # 메모리에 저장된 결과로 누적수익률 곡선 만들기
+            current_equity = 1.0 # 초기 자본금
+            all_equity_curve_values = []
+            all_datetimes_curve = []
+
+            for results_df_window in all_window_results:
+                if results_df_window is not None and not results_df_window.empty and 'trade_return' in results_df_window.columns:
+                    # 각 거래 수익률에 따라 자본금 업데이트
+                    # 현재 윈도우의 첫 거래는 이전 윈도우의 마지막 자본에서 시작
+                    window_equity_values = (1 + results_df_window['trade_return']).cumprod() * current_equity
+                    all_equity_curve_values.extend(window_equity_values.tolist())
+                    all_datetimes_curve.extend(results_df_window.index.tolist())
+                    if not window_equity_values.empty:
+                        current_equity = window_equity_values.iloc[-1] # 다음 윈도우 시작 자본금 업데이트
+            
+            if all_equity_curve_values:
+                # Series 생성 시 index가 중복될 수 있으므로, 재정렬하거나 고유하게 만들어야 함
+                temp_series = pd.Series(all_equity_curve_values, index=pd.to_datetime(all_datetimes_curve))
+                if not temp_series.index.is_unique: # 인덱스 중복 시 처리
+                    temp_series = temp_series.groupby(temp_series.index).first() # 간단히 첫 번째 값 사용
+                temp_series = temp_series.sort_index() # 시간순 정렬
+                all_cum_returns_pct = (temp_series - 1) * 100
+                all_datetimes = temp_series.index.tolist() # 정렬된 인덱스 사용
+            else:
+                all_cum_returns_pct = pd.Series(dtype=float)
+                all_datetimes = []
+        
+        # 데이터가 있을 경우에만 그래프 그리기
+        if all_datetimes and not all_cum_returns_pct.empty:
+            # 그래프 그리기
+            fig, axes = plt.subplots(2, 1, figsize=(16, 10), sharex=False, gridspec_kw={'height_ratios': [3, 1]})
+            
+            # (1) 전체 누적수익률 곡선
+            axes[0].plot(all_datetimes, all_cum_returns_pct, color='b', label='Cumulative Return')
+            axes[0].set_title('Cumulative Return Curve (All Windows)')
+            axes[0].set_ylabel('Cumulative Return (%)')
+            axes[0].legend()
+            axes[0].grid(True)
+            # x축 날짜 포맷
+            axes[0].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            axes[0].xaxis.set_major_locator(mdates.AutoDateLocator())
+            
+            # (2) 윈도우별 수익률 막대그래프
+            window_indices = results_df['window_idx']
+            window_returns = results_df['total_return']
+            axes[1].bar(window_indices, window_returns, color='orange', alpha=0.7, label='Return per Window')
+            axes[1].set_title('Return per Window')
+            axes[1].set_xlabel('Window Index')
+            axes[1].set_ylabel('Return (%)')
+            axes[1].legend()
+            axes[1].grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(results_dir, 
+                f"autogluon_all_windows_returns_t{param['train_hours']}_v{param['val_hours']}_p{round(param['prob_threshold']*10)}_f{param['fee_rate']:.0e}.png".replace('e-0', 'e-')))
+            plt.close()
+        else:
+            print("경고: 누적수익률 곡선을 그릴 데이터가 없습니다!")
+        
+        # 결과 요약
+        print("\n===== AutoGluon 기반 롤링 윈도우 백테스트 결과 요약 =====")
+        print(f"총 윈도우 수: {len(results_df)}")
+        print(f"평균 거래 횟수: {results_df['total_trades'].mean():.1f}")
+        print(f"평균 승률: {results_df['win_rate'].mean():.2%}")
+        print(f"평균 총 수익률: {results_df['total_return'].mean():.2f}%")
+        print(f"평균 소르티노 비율: {results_df['sortino_ratio'].mean():.4f}")
+        
+        print("\n--- 전체 기간 통계 ---")
+        print(f"전체 기간 총 거래 횟수: {results_df['total_trades'].sum()}")
+        print(f"전체 기간 승률: {results_df['win_rate'].mean():.2%}")
+        print(f"전체 기간 총 수익률: {results_df['total_return'].mean():.2f}%")
+        print(f"전체 기간 소르티노 비율: {results_df['sortino_ratio'].mean():.4f}")
+
+        # 요약 정보 저장
+        results_summary = {
+            'total_windows': len(results_df),
+            'avg_trades': results_df['total_trades'].mean(),
+            'avg_win_rate': results_df['win_rate'].mean(),
+            'avg_total_return': results_df['total_return'].mean(),
+            'avg_sortino_ratio': results_df['sortino_ratio'].mean(),
+            'total_trades_overall': results_df['total_trades'].sum(),
+            'win_rate_overall': results_df['win_rate'].mean(),
+            'total_return_overall': results_df['total_return'].mean(),
+            'sortino_ratio_overall': results_df['sortino_ratio'].mean(),
+            'param': param.copy() # param 딕셔너리 복사본 저장
+        }
+        
+        # 최고 성능 윈도우 추가
+        if not results_df.empty:
+            best_return_idx = results_df['total_return'].idxmax()
+            best_window = results_df.iloc[best_return_idx]
+            results_summary['best_window_idx'] = best_window['window_idx']
+            results_summary['best_window_return'] = best_window['total_return']
+            results_summary['best_window_win_rate'] = best_window['win_rate']
+            results_summary['best_window_sortino'] = best_window['sortino_ratio']
+            
+            print(f"\n최고 수익률 윈도우: {best_window['window_idx']}")
+            print(f"기간: {best_window['val_start']} ~ {best_window['val_end']}")
+            print(f"총 거래 횟수: {best_window['total_trades']}")
+            print(f"승률: {best_window['win_rate']:.2%}")
+            print(f"총 수익률: {best_window['total_return']:.2f}%")
+            print(f"소르티노 비율: {best_window['sortino_ratio']:.4f}")
+    else:
+        print("모든 윈도우 백테스트 실패 또는 결과 없음")
+        results_summary = {
+            'status': 'failed_or_no_results',
+            'param': param.copy(),
+            'sortino_ratio_overall': float('-inf'),
+            'total_return_overall': float('-inf'),
+            'win_rate_overall': float('-inf'),
+            'total_trades_overall': 0,
+            'overall_period_start_dt': None,
+            'overall_period_end_dt': None,
+            'cagr_overall': "N/A"
+        }
+    
+    print(f"\n롤링 윈도우 백테스트 완료 (Results dir: {results_dir})")
+    
+    return results_summary
+
+
+if __name__ == "__main__":
+    main()
+
