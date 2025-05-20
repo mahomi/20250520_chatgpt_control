@@ -136,10 +136,10 @@ class FileHandler:
                 f.write(patch_content)
             
             # 패치 적용
-            apply_patch(filename, patch_file)
+            apply_patch(filename, patch_file, filename)
             
             # 임시 파일 삭제
-            os.remove(patch_file)
+            #os.remove(patch_file)
             
             # 변경된 파일 내용 읽기
             with open(filename, 'r', encoding='utf-8') as f:

@@ -1,121 +1,175 @@
 #!/usr/bin/env python3
 # apply_contextual_patch.py
+#
+# unified-diff / git-diff 파일을 원본에 안전하게 적용합니다.
+#
+# 예시
+#   python apply_contextual_patch.py \
+#          --target rolling_window_optuna_org.py \
+#          --patch  temp.patch \
+#          --out    rolling_window_optuna_fixed.py
+#
+# --out 을 생략하면 원본 파일을 바로 덮어씁니다.
+
+from __future__ import annotations
 
 import argparse
 import sys
+from typing import List, Dict, Any
 
-"""
-- 소스를 수정해야할 경우, 소스의 내용이 많아 변경분만 출력해야할 경우에는 unified diff 포맷으로 출력해줘. (패치에 실패하지 않도록 전후 컨텍스트를 생략하지 말고 포함시켜라)
+# ──────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="unified-diff 패치를 적용합니다.")
+    ap.add_argument("--target", required=True, help="원본 파일 경로")
+    ap.add_argument("--patch", required=True, help="패치(diff) 파일 경로")
+    ap.add_argument(
+        "--out",
+        help="결과 저장 경로(생략 시 원본을 덮어씀)",
+    )
+    return ap.parse_args()
 
-python apply_contextual_patch.py --target autogluon_rolling_window.py --patch patch.diff
-"""
+
+# ──────────────────────────────────────────────────────────────
+# File helpers
+# ──────────────────────────────────────────────────────────────
+def read_lines(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.readlines()
 
 
-def main():
-    args = parse_args()
-    apply_patch(args.target, args.patch, args.out)
+def write_lines(path: str, lines: List[str]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
 
 
-def apply_patch(target_file, patch_file, out_file=None):
+# ──────────────────────────────────────────────────────────────
+# Diff 파싱
+# ──────────────────────────────────────────────────────────────
+def parse_hunks(diff_lines: List[str]) -> List[Dict[str, Any]]:
+    """
+    `@@ ... @@` 로 구분되는 hunk 리스트를 반환한다.
+    범위 정보(-10, +10)가 없어도 허용한다.
+    """
+    hunks: List[Dict[str, Any]] = []
+    i, n = 0, len(diff_lines)
 
-    # 원본 읽기
-    with open(target_file, 'r', encoding='utf-8') as f:
-        orig = f.readlines()
-    # diff 읽기
-    with open(patch_file, 'r', encoding='utf-8') as f:
-        diff_lines = f.readlines()
+    while i < n:
+        if diff_lines[i].startswith("@@"):
+            # 헤더 줄 저장(필요 시 참고용)
+            header = diff_lines[i].rstrip("\n\r")
+            i += 1
+            body: List[str] = []
+            while i < n and not diff_lines[i].startswith("@@"):
+                body.append(diff_lines[i])
+                i += 1
+            hunks.append({"header": header, "lines": body})
+        else:
+            i += 1
+    return hunks
 
-    hunks = load_hunks(diff_lines)
+
+# ──────────────────────────────────────────────────────────────
+# 유틸
+# ──────────────────────────────────────────────────────────────
+def norm(line: str) -> str:
+    """개행 제거 + 왼쪽 공백 제거 → 비교용 정규화"""
+    return line.lstrip().rstrip("\n\r")
+
+
+def lines_match(a: str, b: str) -> bool:
+    """좌우 공백 차이는 허용(좌측)하고 내용 비교"""
+    return norm(a) == norm(b)
+
+
+# ──────────────────────────────────────────────────────────────
+# Hunk 적용 (공백 무시 fuzzy-match)
+# ──────────────────────────────────────────────────────────────
+def find_hunk_position(
+    orig: List[str],
+    minus_lines: List[str],
+) -> int | None:
+    """
+    삭제(-) 줄 시퀀스를 orig 에서 찾아 시작 index 반환.
+    좌측 공백 차이는 무시한다.
+    """
+    if not minus_lines:
+        return None
+
+    minus_texts = [norm(l[1:]) for l in minus_lines]  # '-' 제거
+    first = minus_texts[0]
+
+    candidate_idxs = [
+        idx
+        for idx, line in enumerate(orig)
+        if norm(line) == first
+    ]
+
+    for idx in candidate_idxs:
+        if all(
+            idx + j < len(orig) and lines_match(orig[idx + j], minus_texts[j])
+            for j in range(len(minus_texts))
+        ):
+            return idx
+    return None
+
+
+def build_new_block(hunk_lines: List[str]) -> List[str]:
+    """
+    hunk_lines → 실제로 삽입할 줄 시퀀스
+      ' '  : 그대로
+      '+'  : 추가
+      '-'  : 제거(미포함)
+    """
+    block: List[str] = []
+    for raw in hunk_lines:
+        tag, txt = raw[0], raw[1:]
+        if tag in (" ", "+"):
+            block.append(txt if txt.endswith(("\n", "\r")) else txt + "\n")
+    return block
+
+
+def apply_single_hunk(orig: List[str], hunk: Dict[str, Any]) -> List[str]:
+    minus_lines = [l for l in hunk["lines"] if l.startswith("-")]
+
+    # 위치 탐색
+    pos = find_hunk_position(orig, minus_lines)
+    if pos is None:
+        hdr = hunk["header"]
+        raise ValueError(f"hunk 위치를 찾지 못함: {hdr}")
+
+    new_block = build_new_block(hunk["lines"])
+    return orig[:pos] + new_block + orig[pos + len(minus_lines) :]
+
+
+# ──────────────────────────────────────────────────────────────
+# Patch 적용
+# ──────────────────────────────────────────────────────────────
+def apply_patch(target_path: str, patch_path: str, out_path: str | None) -> None:
+    orig_lines = read_lines(target_path)
+    diff_lines = read_lines(patch_path)
+
+    hunks = parse_hunks(diff_lines)
     if not hunks:
         print("적용할 hunk를 찾지 못했습니다.", file=sys.stderr)
         sys.exit(1)
 
-    updated = orig
-    for h in hunks:
-        updated = apply_hunk(updated, h)
+    updated = orig_lines
+    for hunk in hunks:
+        updated = apply_single_hunk(updated, hunk)
 
-    # 쓰기
-    out_path = out_file or target_file
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.writelines(updated)
+    write_lines(out_path or target_path, updated)
+    print(f"패치 적용 완료: {out_path or target_path}")
 
-    print(f"패치 적용 완료: {out_path}")
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="컨텍스트 기반 unified diff를 적용하는 스크립트"
-    )
-    p.add_argument("-t", "--target", required=True,
-                   help="패치를 적용할 원본 파일 경로")
-    p.add_argument("-p", "--patch", required=True,
-                   help="컨텍스트 기반 diff 파일 경로")
-    p.add_argument("-o", "--out", default=None,
-                   help="결과를 쓸 파일 경로 (지정 없으면 원본 덮어쓰기)")
-    return p.parse_args()
+# ──────────────────────────────────────────────────────────────
+# main
+# ──────────────────────────────────────────────────────────────
+def main() -> None:
+    args = parse_args()
+    apply_patch(args.target, args.patch, args.out)
 
-class Hunk:
-    def __init__(self, header):
-        # header: e.g. "@@ def main():" 또는 "@@"
-        self.context = header[2:].strip().rstrip(':')  # 헤더 뒤의 문자열
-        self.lines = []  # diff 본문: ['-old', '+new', ' context', ...]
-    def add_line(self, l): self.lines.append(l.rstrip('\n'))
-
-def load_hunks(diff_lines):
-    hunks = []
-    current = None
-    for raw in diff_lines:
-        if raw.startswith('@@'):
-            current = Hunk(raw)
-            hunks.append(current)
-        elif current is not None:
-            if raw.startswith(('-', '+', ' ')):
-                current.add_line(raw)
-            # else: --- +++ 파일 구분선 등 무시
-    return hunks
-
-def apply_hunk(orig, hunk):
-    """
-    orig: list of 원본 라인(str, 끝에 '\n' 포함)
-    hunk: Hunk 객체
-    """
-    # 1) 시작 위치 찾기
-    if hunk.context:
-        # 헤더에 붙은 컨텍스트 라인을 찾아 그 다음부터 적용
-        idx = next((i for i, L in enumerate(orig) if hunk.context in L), None)
-        if idx is None:
-            print(f"[경고] 헤더 컨텍스트 '{hunk.context}'를 찾을 수 없어 건너뜁니다.", file=sys.stderr)
-            return orig
-        start = idx + 1
-    else:
-        # 첫 번째 '-' 라인 내용으로 위치 탐색
-        first_rm = hunk.lines[0][1:]  # '-...' 에서 내용만
-        # 개행 차이 무시하고 strip 비교
-        idx = next((i for i, L in enumerate(orig) if L.strip() == first_rm.strip()), None)
-        if idx is None:
-            print(f"[경고] 삭제할 라인 '{first_rm.strip()}'을(를) 찾을 수 없어 건너뜁니다.", file=sys.stderr)
-            return orig
-        start = idx
-
-    # 2) hunk 적용
-    new_block = []
-    orig_idx = start
-    for d in hunk.lines:
-        prefix, content = d[0], d[1:]
-        if prefix == ' ':
-            # 컨텍스트: 그대로 유지
-            new_block.append(orig[orig_idx])
-            orig_idx += 1
-        elif prefix == '-':
-            # 삭제: orig 라인만 건너뛰고 new_block에 추가 안 함
-            orig_idx += 1
-        elif prefix == '+':
-            # 추가: new_block에만 추가
-            # content가 개행 포함 안 했다면 개행 붙임
-            if not content.endswith('\n'):
-                content += '\n'
-            new_block.append(content)
-    # 3) 원본 앞/뒤와 결합
-    return orig[:start] + new_block + orig[orig_idx:]
 
 if __name__ == "__main__":
     main()
